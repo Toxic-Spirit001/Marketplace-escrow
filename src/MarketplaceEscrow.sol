@@ -19,17 +19,27 @@ contract MarketplaceEscrow is ReentrancyGuard {
     address public immutable feeRecipient;
     uint256 public immutable feeBps;
     uint256 public immutable confirmWindow;
+    // How long the arbitrator has to rule before the buyer can reclaim the funds
+    uint256 public immutable disputeWindow;
 
-    constructor(address _arbitrator, address _feeRecipient, uint256 _feeBps, uint256 _confirmWindow) {
+    constructor(
+        address _arbitrator,
+        address _feeRecipient,
+        uint256 _feeBps,
+        uint256 _confirmWindow,
+        uint256 _disputeWindow
+    ) {
         require(_arbitrator != address(0), "Invalid arbitrator");
         require(_feeRecipient != address(0), "Invalid fee recipient");
         require(_feeBps <= MAX_FEE_BPS, "Fee too high");
         require(_confirmWindow > 0, "Invalid window");
+        require(_disputeWindow > 0, "Invalid dispute window");
 
         arbitrator = _arbitrator;
         feeRecipient = _feeRecipient;
         feeBps = _feeBps;
         confirmWindow = _confirmWindow;
+        disputeWindow = _disputeWindow;
     }
 
     // =========================
@@ -69,6 +79,9 @@ contract MarketplaceEscrow is ReentrancyGuard {
 
     mapping(uint256 => Listing) public listings;
 
+    // When each order's dispute was opened (0 if never disputed)
+    mapping(uint256 => uint256) public disputedAt;
+
     mapping(uint256 => Order) public orders;
 
     modifier listingExists(uint256 _listingId) {
@@ -100,6 +113,8 @@ contract MarketplaceEscrow is ReentrancyGuard {
     event DisputeOpened(uint256 indexed orderId);
 
     event DisputeResolved(uint256 indexed orderId, bool paidSeller);
+
+    event DisputeTimedOut(uint256 indexed orderId);
 
     event FeesWithdrawn(uint256 amount);
 
@@ -268,6 +283,7 @@ contract MarketplaceEscrow is ReentrancyGuard {
         require(order.status == OrderStatus.Paid || order.status == OrderStatus.Shipped, "Cannot dispute order");
 
         order.status = OrderStatus.Disputed;
+        disputedAt[_orderId] = block.timestamp;
 
         emit DisputeOpened(_orderId);
     }
@@ -290,6 +306,24 @@ contract MarketplaceEscrow is ReentrancyGuard {
         }
 
         emit DisputeResolved(_orderId, _paySeller);
+    }
+
+    // If the arbitrator does not rule within the dispute window, the buyer can take the money back.
+    // The arbitrator can still rule at any time until this is called.
+    function claimDisputeTimeout(uint256 _orderId) external nonReentrant orderExists(_orderId) {
+        Order storage order = orders[_orderId];
+
+        require(msg.sender == order.buyer, "Only buyer can claim");
+
+        require(order.status == OrderStatus.Disputed, "Order is not disputed");
+
+        require(block.timestamp >= disputedAt[_orderId] + disputeWindow, "Dispute window still open");
+
+        order.status = OrderStatus.Refunded;
+
+        _refundBuyer(order);
+
+        emit DisputeTimedOut(_orderId);
     }
 
     // =========================
