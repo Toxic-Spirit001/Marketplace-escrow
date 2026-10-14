@@ -49,11 +49,12 @@ contract MarketplaceEscrowTest is Test {
     uint256 constant PRICE = 1 ether;
     uint256 constant FEE_BPS = 250; // 2.5%
     uint256 constant WINDOW = 3 days;
+    uint256 constant DISPUTE_WINDOW = 7 days;
     uint256 constant FEE = 0.025 ether;
     uint256 constant SELLER_NET = 0.975 ether;
 
     function setUp() public {
-        market = new MarketplaceEscrow(arbitrator, feeRecipient, FEE_BPS, WINDOW);
+        market = new MarketplaceEscrow(arbitrator, feeRecipient, FEE_BPS, WINDOW, DISPUTE_WINDOW);
         rejecter = address(new MarketEtherRejecter());
 
         vm.deal(buyer, 10 ether);
@@ -103,31 +104,32 @@ contract MarketplaceEscrowTest is Test {
         assertEq(market.feeRecipient(), feeRecipient);
         assertEq(market.feeBps(), FEE_BPS);
         assertEq(market.confirmWindow(), WINDOW);
+        assertEq(market.disputeWindow(), DISPUTE_WINDOW);
     }
 
     function testConstructorRejectsZeroArbitrator() public {
         vm.expectRevert("Invalid arbitrator");
-        new MarketplaceEscrow(address(0), feeRecipient, FEE_BPS, WINDOW);
+        new MarketplaceEscrow(address(0), feeRecipient, FEE_BPS, WINDOW, DISPUTE_WINDOW);
     }
 
     function testConstructorRejectsZeroFeeRecipient() public {
         vm.expectRevert("Invalid fee recipient");
-        new MarketplaceEscrow(arbitrator, address(0), FEE_BPS, WINDOW);
+        new MarketplaceEscrow(arbitrator, address(0), FEE_BPS, WINDOW, DISPUTE_WINDOW);
     }
 
     function testConstructorRejectsFeeAboveMax() public {
         vm.expectRevert("Fee too high");
-        new MarketplaceEscrow(arbitrator, feeRecipient, 1001, WINDOW);
+        new MarketplaceEscrow(arbitrator, feeRecipient, 1001, WINDOW, DISPUTE_WINDOW);
     }
 
     function testConstructorAllowsMaxFee() public {
-        MarketplaceEscrow m = new MarketplaceEscrow(arbitrator, feeRecipient, 1000, WINDOW);
+        MarketplaceEscrow m = new MarketplaceEscrow(arbitrator, feeRecipient, 1000, WINDOW, DISPUTE_WINDOW);
         assertEq(m.feeBps(), 1000);
     }
 
     function testConstructorRejectsZeroWindow() public {
         vm.expectRevert("Invalid window");
-        new MarketplaceEscrow(arbitrator, feeRecipient, FEE_BPS, 0);
+        new MarketplaceEscrow(arbitrator, feeRecipient, FEE_BPS, 0, DISPUTE_WINDOW);
     }
 
     // =========================
@@ -724,6 +726,147 @@ contract MarketplaceEscrowTest is Test {
     }
 
     // =========================
+    // DISPUTE TIMEOUT
+    // =========================
+
+    function _disputedShippedOrder() internal returns (uint256 orderId) {
+        orderId = _shippedOrder();
+
+        vm.prank(buyer);
+        market.openDispute(orderId);
+    }
+
+    function testConstructorRejectsZeroDisputeWindow() public {
+        vm.expectRevert("Invalid dispute window");
+        new MarketplaceEscrow(arbitrator, feeRecipient, FEE_BPS, WINDOW, 0);
+    }
+
+    function testDisputeRecordsOpenTime() public {
+        uint256 orderId = _disputedShippedOrder();
+
+        assertEq(market.disputedAt(orderId), block.timestamp);
+    }
+
+    function testBuyerCanReclaimAfterDisputeTimeout() public {
+        uint256 orderId = _disputedShippedOrder();
+        uint256 balanceBefore = buyer.balance;
+
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        vm.prank(buyer);
+        market.claimDisputeTimeout(orderId);
+
+        assertEq(uint256(_status(orderId)), uint256(MarketplaceEscrow.OrderStatus.Refunded));
+        assertEq(buyer.balance, balanceBefore + PRICE);
+        assertEq(address(market).balance, 0);
+
+        // The order had shipped, so the unit is not put back on the shelf
+        (,,, uint256 stock,) = market.listings(0);
+        assertEq(stock, 1);
+    }
+
+    function testDisputeTimeoutRestoresStockForUnshippedOrder() public {
+        uint256 orderId = _paidOrder();
+
+        vm.prank(buyer);
+        market.openDispute(orderId);
+
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        vm.prank(buyer);
+        market.claimDisputeTimeout(orderId);
+
+        (,,, uint256 stock,) = market.listings(0);
+        assertEq(stock, 2);
+    }
+
+    function testCannotClaimDisputeTimeoutEarly() public {
+        uint256 orderId = _disputedShippedOrder();
+
+        vm.warp(block.timestamp + DISPUTE_WINDOW - 1);
+
+        vm.prank(buyer);
+        vm.expectRevert("Dispute window still open");
+        market.claimDisputeTimeout(orderId);
+    }
+
+    function testOnlyBuyerCanClaimDisputeTimeout() public {
+        uint256 orderId = _disputedShippedOrder();
+
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        vm.prank(seller);
+        vm.expectRevert("Only buyer can claim");
+        market.claimDisputeTimeout(orderId);
+
+        vm.prank(stranger);
+        vm.expectRevert("Only buyer can claim");
+        market.claimDisputeTimeout(orderId);
+    }
+
+    function testCannotClaimDisputeTimeoutOnUndisputedOrder() public {
+        uint256 orderId = _shippedOrder();
+
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        vm.prank(buyer);
+        vm.expectRevert("Order is not disputed");
+        market.claimDisputeTimeout(orderId);
+    }
+
+    function testCannotClaimDisputeTimeoutTwice() public {
+        uint256 orderId = _disputedShippedOrder();
+
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        vm.prank(buyer);
+        market.claimDisputeTimeout(orderId);
+
+        vm.prank(buyer);
+        vm.expectRevert("Order is not disputed");
+        market.claimDisputeTimeout(orderId);
+    }
+
+    function testArbitratorCanStillResolveAfterDisputeWindow() public {
+        uint256 orderId = _disputedShippedOrder();
+
+        vm.warp(block.timestamp + DISPUTE_WINDOW + 1 days);
+
+        vm.prank(arbitrator);
+        market.resolveDispute(orderId, true);
+
+        assertEq(uint256(_status(orderId)), uint256(MarketplaceEscrow.OrderStatus.Completed));
+        assertEq(seller.balance, SELLER_NET);
+    }
+
+    function testCannotClaimDisputeTimeoutAfterArbitratorRules() public {
+        uint256 orderId = _disputedShippedOrder();
+
+        vm.prank(arbitrator);
+        market.resolveDispute(orderId, true);
+
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        vm.prank(buyer);
+        vm.expectRevert("Order is not disputed");
+        market.claimDisputeTimeout(orderId);
+    }
+
+    function testDisputeTimeoutRefundFailureReverts() public {
+        uint256 listingId = _listAs(seller, 1);
+        uint256 orderId = _buyAs(rejecter, listingId);
+
+        vm.prank(rejecter);
+        market.openDispute(orderId);
+
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        vm.prank(rejecter);
+        vm.expectRevert("Refund failed");
+        market.claimDisputeTimeout(orderId);
+    }
+
+    // =========================
     // REENTRANCY
     // =========================
 
@@ -767,7 +910,7 @@ contract MarketplaceEscrowTest is Test {
 
     function testReentrancyBlockedDuringFeeWithdrawal() public {
         MarketReentrant attacker = new MarketReentrant();
-        MarketplaceEscrow m = new MarketplaceEscrow(arbitrator, address(attacker), FEE_BPS, WINDOW);
+        MarketplaceEscrow m = new MarketplaceEscrow(arbitrator, address(attacker), FEE_BPS, WINDOW, DISPUTE_WINDOW);
 
         vm.prank(seller);
         m.createListing("Laptop", PRICE, 1);
@@ -836,7 +979,7 @@ contract MarketplaceEscrowTest is Test {
     }
 
     function testWithdrawFeesFailureReverts() public {
-        MarketplaceEscrow m = new MarketplaceEscrow(arbitrator, rejecter, FEE_BPS, WINDOW);
+        MarketplaceEscrow m = new MarketplaceEscrow(arbitrator, rejecter, FEE_BPS, WINDOW, DISPUTE_WINDOW);
 
         vm.prank(seller);
         m.createListing("Laptop", PRICE, 1);
@@ -856,7 +999,7 @@ contract MarketplaceEscrowTest is Test {
     }
 
     function testZeroFeeMarketplacePaysSellerInFull() public {
-        MarketplaceEscrow m = new MarketplaceEscrow(arbitrator, feeRecipient, 0, WINDOW);
+        MarketplaceEscrow m = new MarketplaceEscrow(arbitrator, feeRecipient, 0, WINDOW, DISPUTE_WINDOW);
 
         vm.prank(seller);
         m.createListing("Laptop", PRICE, 1);
@@ -884,7 +1027,7 @@ contract MarketplaceEscrowTest is Test {
         price = bound(price, 1, 100 ether);
         bps = bound(bps, 0, 1000);
 
-        MarketplaceEscrow m = new MarketplaceEscrow(arbitrator, feeRecipient, bps, WINDOW);
+        MarketplaceEscrow m = new MarketplaceEscrow(arbitrator, feeRecipient, bps, WINDOW, DISPUTE_WINDOW);
 
         vm.prank(seller);
         m.createListing("Item", price, 1);
